@@ -49,6 +49,24 @@ CaPyCli allows you to
 * show information about the project and its releases
 * show information about export control information and security vulnerabilities (if tracked via SW360)
 
+## Stable Frontend API Runtime (Local)
+
+Use these scripts when your frontend team needs a stable API process on port 8000.
+
+1. Create or refresh a dedicated API virtual environment:
+
+  ./scripts/setup_frontend_api_env.sh
+
+2. Start the API using that environment:
+
+  ./scripts/run_frontend_api.sh
+
+Notes:
+
+* The runtime is isolated in .venv_frontend_api and does not depend on your active shell Python.
+* The start script exports PYTHONPATH to the repository root so background jobs can run capycli reliably from temporary folders.
+* You can override the bind settings with environment variables HOST and PORT.
+
 ## Basic Syntax
 
 ```code

@@ -9,7 +9,10 @@
 """Contains the logic for all of the default options for CaPyCli."""
 
 import os
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - only used on Python < 3.11
+    import tomli as tomllib
 from typing import Any, Dict
 
 import capycli

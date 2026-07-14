@@ -9,7 +9,10 @@
 import logging
 import os
 import sys
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - only used on Python < 3.11
+    import tomli as tomllib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 

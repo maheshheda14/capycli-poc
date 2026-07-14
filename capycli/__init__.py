@@ -19,8 +19,12 @@ import importlib
 import logging
 import os
 import sys
-import tomllib
 from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - only used on Python < 3.11
+    import tomli as tomllib
 
 from colorama import Fore, Style, init
 

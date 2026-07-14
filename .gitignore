@@ -50,3 +50,4 @@ SoftwareClearing/*.txt
 !SoftwareClearing/projectinfo.json
 
 build/
+.venv_frontend_api/
