@@ -39,6 +39,10 @@ app = FastAPI(title="CaPyCli Onboarding API")
 JOBS: Dict[str, Dict[str, Any]] = {}
 JOBS_LOCK = Lock()
 
+QUALITY_DOC_REL_PATH = os.path.join("documentation", "SBOM_Quality.md")
+QUALITY_DOC_VIEW_URL = "/api/docs/sbom-quality"
+QUALITY_DOC_DOWNLOAD_URL = "/api/docs/sbom-quality/download"
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -337,6 +341,178 @@ def _percent(part: int, total: int) -> float:
     return round((part / total) * 100.0, 1)
 
 
+def build_quality_quick_info(quality_status: str, quality_score: float) -> List[str]:
+    """Return short, user-friendly quality guidance for UI display."""
+    info = [
+        "This score is based on license, package URL (purl), and hash coverage.",
+        "A score >= 85 is considered good for SW360 onboarding workflows.",
+    ]
+
+    if quality_status == "good":
+        info.append(f"Current score {quality_score} indicates the SBOM is ready for sync.")
+    elif quality_status == "fair":
+        info.append(
+            f"Current score {quality_score} indicates usable quality; improve metadata before sync if possible."
+        )
+    else:
+        info.append(
+            f"Current score {quality_score} indicates major metadata gaps; improve before sync."
+        )
+    return info
+
+
+def validate_granularity(sbom_content: Dict[str, Any]) -> Dict[str, Any]:
+    """Check SBOM for potential granularity issues (e.g., Angular packages from same source)."""
+    issues: List[Dict[str, Any]] = []
+    
+    try:
+        from capycli.bom.check_granularity import CheckGranularity
+        
+        checker = CheckGranularity()
+        checker.read_granularity_list()
+        
+        components = sbom_content.get("components", [])
+        for component in components:
+            if not isinstance(component, dict):
+                continue
+                
+            comp_name = component.get("name", "").strip()
+            
+            for issue in checker.granularity_list:
+                if issue.component.lower() in comp_name.lower():
+                    issues.append({
+                        "component": comp_name,
+                        "suggestion": issue.replacement,
+                        "comment": issue.comment,
+                    })
+    except Exception as exc:
+        return {
+            "performed": False,
+            "error": f"Granularity check failed: {str(exc)[:100]}",
+            "issues": [],
+        }
+    
+    return {
+        "performed": True,
+        "issue_count": len(issues),
+        "has_issues": len(issues) > 0,
+        "issues": issues[:10],  # Limit to 10 issues for response
+        "message": f"Found {len(issues)} potential granularity issue(s)" if issues else "No granularity issues detected",
+    }
+
+
+def validate_dependencies(sbom_content: Dict[str, Any]) -> Dict[str, Any]:
+    """Analyze SBOM dependencies for health and completeness."""
+    analysis: Dict[str, Any] = {
+        "component_count": 0,
+        "components_with_dependencies": 0,
+        "orphaned_components": 0,
+        "unmapped_components": 0,
+        "missing_metadata": {
+            "no_license": 0,
+            "no_purl": 0,
+            "no_hash": 0,
+            "no_external_refs": 0,
+        },
+    }
+    
+    try:
+        components = sbom_content.get("components", [])
+        analysis["component_count"] = len(components)
+        
+        dependencies = sbom_content.get("dependencies", [])
+        mapped_components = set()
+        
+        # Track which components are referenced in dependencies
+        for dep in dependencies:
+            if isinstance(dep, dict):
+                ref = dep.get("ref")
+                if ref:
+                    mapped_components.add(ref)
+        
+        for idx, component in enumerate(components):
+            if not isinstance(component, dict):
+                continue
+            
+            comp_ref = component.get("bom-ref")
+            
+            # Check if component has dependencies
+            for dep in dependencies:
+                if isinstance(dep, dict) and dep.get("ref") == comp_ref:
+                    if dep.get("dependsOn"):
+                        analysis["components_with_dependencies"] += 1
+                    break
+            
+            # Check if component is orphaned (not referenced by any dependency)
+            if comp_ref and comp_ref not in mapped_components:
+                analysis["orphaned_components"] += 1
+            
+            # Check for unmapped components (no SW360 ID)
+            props = component.get("properties", [])
+            has_sw360_id = False
+            for prop in props:
+                if isinstance(prop, dict) and prop.get("name") == "siemens:sw360Id":
+                    has_sw360_id = True
+                    break
+            if not has_sw360_id:
+                analysis["unmapped_components"] += 1
+            
+            # Check for missing metadata
+            if not component.get("licenses"):
+                analysis["missing_metadata"]["no_license"] += 1
+            if not component.get("purl"):
+                analysis["missing_metadata"]["no_purl"] += 1
+            hashes = component.get("hashes", [])
+            if not hashes or len(hashes) == 0:
+                analysis["missing_metadata"]["no_hash"] += 1
+            if not component.get("externalReferences"):
+                analysis["missing_metadata"]["no_external_refs"] += 1
+        
+        # Calculate percentages
+        total = analysis["component_count"]
+        if total > 0:
+            analysis["metadata_coverage"] = {
+                "license_percent": _percent(total - analysis["missing_metadata"]["no_license"], total),
+                "purl_percent": _percent(total - analysis["missing_metadata"]["no_purl"], total),
+                "hash_percent": _percent(total - analysis["missing_metadata"]["no_hash"], total),
+                "external_refs_percent": _percent(total - analysis["missing_metadata"]["no_external_refs"], total),
+            }
+        
+        analysis["health_score"] = round(
+            (analysis["metadata_coverage"]["license_percent"] * 0.3 +
+             analysis["metadata_coverage"]["purl_percent"] * 0.3 +
+             analysis["metadata_coverage"]["hash_percent"] * 0.4) / 100, 1
+        ) if total > 0 else 0.0
+        
+    except Exception as exc:
+        return {
+            "performed": False,
+            "error": f"Dependency analysis failed: {str(exc)[:100]}",
+        }
+    
+    return {"performed": True, **analysis}
+
+
+def validate_sbom_schema(sbom_path: str) -> Dict[str, Any]:
+    """Validate SBOM against CycloneDX schema."""
+    try:
+        from capycli.common.capycli_bom_support import CaPyCliBom
+        
+        is_valid = bool(CaPyCliBom.validate_sbom(sbom_path, "1.6", False))
+        return {
+            "performed": True,
+            "valid": is_valid,
+            "spec_version": "1.6",
+            "message": "SBOM schema is valid" if is_valid else "SBOM schema validation failed",
+        }
+    except Exception as exc:
+        return {
+            "performed": True,
+            "valid": False,
+            "error": f"Schema validation error: {str(exc)[:100]}",
+        }
+
+
 def build_sbom_summary(sbom_content: Dict[str, Any]) -> Dict[str, Any]:
     """Build frontend-friendly summary metrics from generated SBOM."""
     components = sbom_content.get("components", [])
@@ -522,6 +698,14 @@ def build_sbom_summary(sbom_content: Dict[str, Any]) -> Dict[str, Any]:
             "status": quality_status,
             "formula": "0.4*license + 0.3*purl + 0.3*hash",
             "reference": "documentation/SBOM_Quality.md",
+            "quick_info": build_quality_quick_info(quality_status, quality_score),
+            "documentation": {
+                "path": QUALITY_DOC_REL_PATH,
+                "view_url": QUALITY_DOC_VIEW_URL,
+                "download_url": QUALITY_DOC_DOWNLOAD_URL,
+                "view_url_absolute": QUALITY_DOC_VIEW_URL,
+                "download_url_absolute": QUALITY_DOC_DOWNLOAD_URL,
+            },
             "methodology": "CaPyCli guidance for SBOM quality, summarized into license, purl, and hash coverage metrics.",
             "meaning": quality_meaning,
             "hint": quality_hint,
@@ -535,6 +719,53 @@ def build_sbom_summary(sbom_content: Dict[str, Any]) -> Dict[str, Any]:
             "recommendations": recommendations,
         },
     }
+
+
+def add_absolute_doc_urls(summary: Dict[str, Any], request: Request) -> Dict[str, Any]:
+    """Populate absolute view/download URLs for the quality documentation links.
+
+    The frontend cannot download using a relative path, so we build fully
+    qualified URLs from the incoming request's base URL (scheme + host + port).
+    """
+    quality = summary.get("quality")
+    if not isinstance(quality, dict):
+        return summary
+
+    documentation = quality.get("documentation")
+    if not isinstance(documentation, dict):
+        return summary
+
+    base_url = str(request.base_url).rstrip("/")
+    documentation["view_url_absolute"] = f"{base_url}{QUALITY_DOC_VIEW_URL}"
+    documentation["download_url_absolute"] = f"{base_url}{QUALITY_DOC_DOWNLOAD_URL}"
+    return summary
+
+
+@app.get(QUALITY_DOC_VIEW_URL)
+async def view_sbom_quality_doc() -> Response:
+    """Render the SBOM quality guidance document as markdown text."""
+    quality_doc_path = os.path.join(PROJECT_ROOT, QUALITY_DOC_REL_PATH)
+    if not os.path.isfile(quality_doc_path):
+        return JSONResponse(status_code=404, content={"error": "SBOM quality document not found."})
+
+    with open(quality_doc_path, "r", encoding="utf-8") as handle:
+        content = handle.read()
+
+    return Response(content=content, media_type="text/markdown; charset=utf-8")
+
+
+@app.get(QUALITY_DOC_DOWNLOAD_URL)
+async def download_sbom_quality_doc() -> Response:
+    """Download the SBOM quality guidance markdown file."""
+    quality_doc_path = os.path.join(PROJECT_ROOT, QUALITY_DOC_REL_PATH)
+    if not os.path.isfile(quality_doc_path):
+        return JSONResponse(status_code=404, content={"error": "SBOM quality document not found."})
+
+    with open(quality_doc_path, "rb") as handle:
+        content = handle.read()
+
+    headers = {"Content-Disposition": 'attachment; filename="SBOM_Quality.md"'}
+    return Response(content=content, media_type="text/markdown", headers=headers)
 
 
 def build_sbom_component_details(sbom_content: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -996,17 +1227,6 @@ async def check_sbom_quality(
                 with open(sbom_path, "wb") as handle:
                     handle.write(uploaded_bytes)
 
-                quality_summary = {}
-                validation_result = {"valid": False, "spec_version": "1.6"}
-
-                from capycli.common.capycli_bom_support import CaPyCliBom
-
-                validation_result["valid"] = bool(CaPyCliBom.validate_sbom(sbom_path, "1.6", False))
-                validation_result["message"] = (
-                    "JSON file successfully validated against CycloneDX." if validation_result["valid"]
-                    else "SBOM validation failed."
-                )
-
                 try:
                     with open(sbom_path, "r", encoding="utf-8") as handle:
                         sbom_content = json.load(handle)
@@ -1016,11 +1236,40 @@ async def check_sbom_quality(
                 if not isinstance(sbom_content, dict):
                     return JSONResponse(status_code=422, content={"error": "Uploaded SBOM must be a JSON object."})
 
+                # Run all 3 validations
+                schema_validation = validate_sbom_schema(sbom_path)
+                granularity_validation = validate_granularity(sbom_content)
+                dependency_validation = validate_dependencies(sbom_content)
+                
                 quality_summary = build_sbom_summary(sbom_content)
+                quality_summary = add_absolute_doc_urls(quality_summary, request)
+                
+                # Create a synthetic job entry for directly uploaded SBOMs
+                # so frontend can use the jobId to sync to SW360.
+                if not response_job_id:
+                    response_job_id = str(uuid4())
+                    set_job(
+                        response_job_id,
+                        jobId=response_job_id,
+                        state="completed",
+                        success=True,
+                        phase="sbom_ready",
+                        source="uploaded_file",
+                        message="SBOM uploaded and checked successfully. Ready for SW360 sync.",
+                        sbom=sbom_content,
+                        sbom_summary=quality_summary,
+                        created_at=utc_now_iso(),
+                        finished_at=utc_now_iso(),
+                    )
+                
                 return JSONResponse(content={
                     "jobId": response_job_id,
                     "source": "uploaded_file",
-                    "validation": validation_result,
+                    "validations": {
+                        "schema": schema_validation,
+                        "granularity": granularity_validation,
+                        "dependencies": dependency_validation,
+                    },
                     "quality": quality_summary.get("quality", {}),
                     "sbom_summary": quality_summary,
                 })
@@ -1038,28 +1287,31 @@ async def check_sbom_quality(
         return JSONResponse(status_code=409, content={"error": "SBOM is not available for validation. Generate it first."})
 
     quality_summary = build_sbom_summary(sbom_content)
+    quality_summary = add_absolute_doc_urls(quality_summary, request)
 
-    validation_result = {"valid": False, "spec_version": "1.6"}
+    # Run all 3 validations
     try:
-        from capycli.common.capycli_bom_support import CaPyCliBom
-
         with tempfile.TemporaryDirectory(prefix="capycli_sbom_check_") as workdir:
             sbom_path = os.path.join(workdir, "sbom.json")
             with open(sbom_path, "w", encoding="utf-8") as handle:
                 json.dump(sbom_content, handle, indent=2)
 
-            validation_result["valid"] = bool(CaPyCliBom.validate_sbom(sbom_path, "1.6", False))
-            validation_result["message"] = (
-                "JSON file successfully validated against CycloneDX." if validation_result["valid"]
-                else "SBOM validation failed."
-            )
+            schema_validation = validate_sbom_schema(sbom_path)
+            granularity_validation = validate_granularity(sbom_content)
+            dependency_validation = validate_dependencies(sbom_content)
     except Exception as exc:
-        validation_result["message"] = f"SBOM validation error: {str(exc)[:200]}"
+        schema_validation = {"performed": False, "error": str(exc)[:200]}
+        granularity_validation = {"performed": False, "error": str(exc)[:200]}
+        dependency_validation = {"performed": False, "error": str(exc)[:200]}
 
     response = {
         "jobId": str(resolved_sbom_job_id),
         "source": "generated_job",
-        "validation": validation_result,
+        "validations": {
+            "schema": schema_validation,
+            "granularity": granularity_validation,
+            "dependencies": dependency_validation,
+        },
         "quality": quality_summary.get("quality", {}),
         "sbom_summary": quality_summary,
     }
@@ -1243,6 +1495,50 @@ SW360_SYNC_PIPELINE: List[Dict[str, str]] = [
 ]
 
 
+def apply_ecosystem_filter(
+    sbom_path: str,
+    filtered_sbom_path: str,
+    ecosystem: str,
+    workdir: str,
+    env: Dict[str, str],
+) -> Dict[str, Any]:
+    """Apply ecosystem-specific filter to SBOM to remove noise/duplicates."""
+    filter_map = {
+        "javascript": "javascript-cleanup.json",
+        "python": "python-cleanup.json",
+        "mavenpom": "mavenpom-cleanup.json",
+        "nuget": "nuget-cleanup.json",
+        "rust": "rust-cleanup.json",
+    }
+    
+    filter_file_name = filter_map.get(ecosystem.lower())
+    if not filter_file_name:
+        # No filter for this ecosystem, skip silently
+        return {"ok": True, "filtered": False, "reason": f"No filter available for {ecosystem}"}
+    
+    filter_path = os.path.join(PROJECT_ROOT, "filters", filter_file_name)
+    if not os.path.isfile(filter_path):
+        # Filter file not found, skip
+        return {"ok": True, "filtered": False, "reason": f"Filter file not found: {filter_file_name}"}
+    
+    # Run bom filter command
+    result = run_step(
+        "filter",
+        ["bom", "filter", "-i", os.path.basename(sbom_path), 
+         "-o", os.path.basename(filtered_sbom_path),
+         "-filterfile", filter_path, "-v"],
+        workdir,
+        env,
+    )
+    
+    if result["ok"]:
+        return {"ok": True, "filtered": True, "filter_file": filter_file_name}
+    else:
+        # Log the filter failure but don't block the whole job
+        print(f"Filter step failed for {ecosystem}: {result.get('stderr', '')}")
+        return {"ok": False, "filtered": False, "error": result.get("stderr", "")}
+
+
 def process_sbom_generate_job(
     job_id: str,
     ecosystem: str,
@@ -1286,6 +1582,19 @@ def process_sbom_generate_job(
                     finished_at=utc_now_iso(),
                 )
                 return
+
+            # Apply ecosystem-specific filter to remove noise/duplicates
+            sbom_filtered = "sbom.filtered.json"
+            sbom_filtered_path = os.path.join(workdir, sbom_filtered)
+            filter_result = apply_ecosystem_filter(sbom_path, sbom_filtered_path, ecosystem, workdir, env)
+            
+            # If filter was applied successfully, use the filtered SBOM
+            if filter_result.get("filtered"):
+                sbom_path = sbom_filtered_path
+                set_job(job_id, filter_applied=True, filter_file=filter_result.get("filter_file"))
+            elif not filter_result.get("ok"):
+                # Log filter error but continue with unfiltered SBOM
+                set_job(job_id, filter_error=filter_result.get("error"))
 
             # Load and return the SBOM components for display
             components = load_sbom_components(sbom_path)
