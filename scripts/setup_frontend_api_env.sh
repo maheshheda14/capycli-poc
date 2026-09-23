@@ -17,7 +17,11 @@ fi
 
 echo "Using Python: ${PYTHON_BIN}"
 
-if [[ ! -d "${VENV_DIR}" ]]; then
+if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
+  if [[ -d "${VENV_DIR}" ]]; then
+    echo "Incomplete virtualenv detected; recreating it..."
+    rm -rf "${VENV_DIR}"
+  fi
   "${PYTHON_BIN}" -m venv "${VENV_DIR}"
 fi
 
