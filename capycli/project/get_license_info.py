@@ -1,5 +1,5 @@
 ﻿# -------------------------------------------------------------------------------
-# Copyright (c) 2019-2024 Siemens
+# Copyright (c) 2019-2026 Siemens
 # All Rights Reserved.
 # Author: thomas.graf@siemens.com
 #
@@ -12,7 +12,7 @@ import os
 import sys
 from typing import Any, Dict, List
 
-from sw360 import SW360Error
+from sw360 import SW360Error, SW360Keycloak
 
 import capycli.common.script_base
 from capycli.common.json_support import load_json_file
@@ -197,6 +197,8 @@ class GetLicenseInfo(capycli.common.script_base.ScriptBase):
   -nconf, --no-overwrite-config  do not overwrite an existing configuration file
   -all                           add all available CLI files of a component
   --forceerror                   force an error exit code in case of missing information
+  -client_id CLIENT_ID           the SW360 client_id to be used for token generation
+  -client_secret CLIENT_SECRET   the SW360 client_secret to be used for token generation
         """)
 
         print()
@@ -238,6 +240,42 @@ class GetLicenseInfo(capycli.common.script_base.ScriptBase):
             if not os.path.isfile(args.inputfile):
                 print_red("Input file not found!")
                 sys.exit(ResultCode.RESULT_FILE_NOT_FOUND)
+
+        if not args.sw360_token:
+            # command line argument precede environment variables
+            client_id = args.client_id
+            client_secret = args.client_secret
+
+            if not args.client_id and (not args.client_secret):
+                # look for environment variables
+                client_id = os.getenv("SW360Client_id")
+                client_secret = os.getenv("SW360Client_secret")
+                if client_id and client_secret and args.verbose:
+                    print_text("  Found client id and client secret in environment variables.")
+
+            if client_id and client_secret:
+                url = args.sw360_url
+                if not url:
+                    url = os.environ.get("SW360ServerUrl", "")
+                if not url:
+                    print_red("  SW360 URL not specified!")
+                    sys.exit(ResultCode.RESULT_COMMAND_ERROR)
+
+                if args.verbose:
+                    print_text("  Creating token using client id and secret...")
+                kc = SW360Keycloak(url)
+                args.sw360_token = kc.get_keycloak_token(client_id, client_secret, write_access=False)
+                if args.sw360_token:
+                    args.oauth2 = True
+                    if args.verbose:
+                        print_text("  Got token.")
+                else:
+                    print_red("  Failed to get token!")
+                    sys.exit(ResultCode.RESULT_AUTH_ERROR)
+
+        if args.sw360_token and args.oauth2 and args.verbose:
+            self.analyze_token(args.sw360_token)
+            print_text("")
 
         if not self.login(token=args.sw360_token, url=args.sw360_url, oauth2=args.oauth2):
             print_red("ERROR: login failed!")

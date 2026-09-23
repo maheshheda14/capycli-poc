@@ -5,12 +5,21 @@
 
 # CaPyCli - Clearing Automation Python Command Line Tool for SW360
 
-## NEXT
+## 2.12.0
+
+* Because of security reasons `-client_id` and `-client_secret` should only
+  be considered as fallback. Primary source for this information are the
+  environment variables `SW360Client_id` and `SW360Client_secret`.
+* Dependency updates.
+
+## 2.12.0.dev1
 
 * Fix for issue 218: Bug when using capycli bom map -o outmap (v2.11.1).
   Fixes CaPyCLI so that it doesn't crash. But the root cause cannot get
   fixed: SW360 releases may have multiple purls, CycloneDX components
   can have only one single purl.
+* New options `-client_id` and `-client_secret` to support dynamic token generation
+  with the new SW360 backend >= 20.
 * update dependencies, especially "idna" to fix CVE-2026-45409 and "sw360" lib
   to fix CVE-2026-41066,  CVE-2026-44431 and CVE-2026-44432. When accessing a
   trusted SW360 server using REST API, they all shouldn't be critical, however.
@@ -20,6 +29,9 @@
   and `bom createreleases`. The property is used as fallback when server sends no
   `Content-Disposition` header. Useful for URLs that end in a version tag without
   file name (e.g. `.../archive/refs/tags/v2.3.4`), see Readme_BOM.md.
+* Update dependencies.
+* Update sw360 to version 1.12.0.dev3.
+* Tested with new SW360 backend v20 and Keycloak tokens.
 
 ## 2.11.1
 
